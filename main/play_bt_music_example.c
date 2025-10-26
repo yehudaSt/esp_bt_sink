@@ -105,6 +105,10 @@ void app_main(void)
     ESP_LOGI(TAG, "[ 2 ] Start codec chip");
     audio_board_handle_t board_handle = audio_board_init();
     audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_DECODE, AUDIO_HAL_CTRL_START);
+    
+    // Set volume to maximum (100%)
+    ESP_LOGI(TAG, "[ 2.1 ] Set volume to maximum");
+    audio_hal_set_volume(board_handle->audio_hal, 100);
 
     ESP_LOGI(TAG, "[ 3 ] Create audio pipeline for playback");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
@@ -166,45 +170,18 @@ void app_main(void)
     audio_pipeline_run(pipeline);
 
     ESP_LOGI(TAG, "[ 7 ] Listen for all pipeline events");
+    ESP_LOGI(TAG, "Bluetooth service is running, waiting for device to connect...");
     bool bluetooth_connected = false;
+    int event_count = 0;
     while (1) {
         audio_event_iface_msg_t msg;
-        esp_err_t ret = audio_event_iface_listen(evt, &msg, bluetooth_connected ? portMAX_DELAY : 1000 / portTICK_PERIOD_MS);
+        esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
+        event_count++;
         
-        if (!bluetooth_connected) {
-            ESP_LOGI(TAG, "Attempting to reconnect Bluetooth...");
-            // Restart Bluetooth service if disconnected
-            bluetooth_service_destroy();
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-            
-            bluetooth_service_cfg_t bt_cfg = {
-                .device_name = "ESP-ADF-SPEAKER",
-                .mode = BLUETOOTH_A2DP_SINK,
-                .user_callback.user_avrc_ct_cb = bt_app_avrc_ct_cb,
-            };
-            esp_err_t bt_start_ret = bluetooth_service_start(&bt_cfg);
-            if (bt_start_ret == ESP_OK) {
-                ESP_LOGI(TAG, "Bluetooth service restarted, waiting for connection...");
-                // Recreate Bluetooth peripheral and stream
-                bt_stream_reader = bluetooth_service_create_stream();
-                bt_periph = bluetooth_service_create_periph();
-                esp_periph_start(set, bt_periph);
-                
-                // Re-register elements to the pipeline
-                audio_pipeline_register(pipeline, bt_stream_reader, "bt");
-                
-#if (CONFIG_ESP_LYRATD_MSC_V2_1_BOARD || CONFIG_ESP_LYRATD_MSC_V2_2_BOARD)
-                const char *link_tag[3] = {"bt", "filter", "i2s"};
-                audio_pipeline_link(pipeline, &link_tag[0], 3);
-#else
-                const char *link_tag[2] = {"bt", "i2s"};
-                audio_pipeline_link(pipeline, &link_tag[0], 2);
-#endif
-                audio_pipeline_run(pipeline);
-            } else {
-                ESP_LOGE(TAG, "Failed to restart Bluetooth service: %d", bt_start_ret);
-            }
-            continue;
+        // Periodic status update every 100 events
+        if (event_count % 100 == 0) {
+            ESP_LOGI(TAG, "[STATUS] Events processed: %d, Bluetooth connected: %s", 
+                     event_count, bluetooth_connected ? "YES" : "NO");
         }
         
         if (ret != ESP_OK) {
@@ -229,7 +206,8 @@ void app_main(void)
 #else
             i2s_stream_set_clk(i2s_stream_writer, music_info.sample_rates, music_info.bits, music_info.channels);
 #endif
-            bluetooth_connected = true;
+            // Music info confirms audio is flowing - this is good confirmation
+            ESP_LOGI(TAG, "[ * ] Audio stream established successfully");
             continue;
         }
 
@@ -254,22 +232,12 @@ void app_main(void)
         /* Handle Bluetooth connection/disconnection events */
         if (msg.source_type == PERIPH_ID_BLUETOOTH
             && msg.source == (void *)bt_periph) {
-            if (msg.cmd == PERIPH_BLUETOOTH_DISCONNECTED) {
-                ESP_LOGW(TAG, "[ * ] Bluetooth disconnected");
-                bluetooth_connected = false;
-                
-                // Clean up the current BT connection
-                audio_pipeline_stop(pipeline);
-                audio_pipeline_wait_for_stop(pipeline);
-                
-                audio_pipeline_unregister(pipeline, bt_stream_reader);
-                audio_element_deinit(bt_stream_reader);
-                
-                // Don't break the main loop, we'll try to reconnect
-                continue;
-            } else if (msg.cmd == PERIPH_BLUETOOTH_CONNECTED) {
-                ESP_LOGI(TAG, "[ * ] Bluetooth connected");
+            if (msg.cmd == PERIPH_BLUETOOTH_CONNECTED) {
+                ESP_LOGI(TAG, "[ * ] Bluetooth device connected successfully");
                 bluetooth_connected = true;
+            } else if (msg.cmd == PERIPH_BLUETOOTH_DISCONNECTED) {
+                ESP_LOGW(TAG, "[ * ] Bluetooth device disconnected");
+                bluetooth_connected = false;
             }
         }
 
